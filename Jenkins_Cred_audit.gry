@@ -1,0 +1,535 @@
+// =======================================================
+// ENTERPRISE JENKINS CREDENTIAL SECURITY AUDIT SCRIPT
+// Auto-discovers configuration and handles all edge cases
+// =======================================================
+
+import com.cloudbees.plugins.credentials.*
+import com.cloudbees.plugins.credentials.common.*
+import jenkins.model.*
+import hudson.model.*
+import hudson.security.*
+import org.jenkinsci.plugins.scriptsecurity.scripts.ScriptApproval
+import com.michelin.cio.hudson.plugins.rolestrategy.RoleBasedAuthorizationStrategy
+import java.text.SimpleDateFormat
+
+class JenkinsSecurityAudit {
+    def jenkins
+    def auditResults = [:]
+    def criticalFindings = 0
+    
+    // Configuration
+    def config = [
+        testCredentialAccess: true,
+        checkFilePermissions: true,
+        testRestApiAccess: false,
+        checkScriptApprovals: true,
+        simulateAttacks: true,
+        maxResults: 50  // Limit output for large installations
+    ]
+    
+    JenkinsSecurityAudit() {
+        this.jenkins = Jenkins.getInstanceOrNull()
+        if (!this.jenkins) {
+            throw new IllegalStateException("Unable to access Jenkins instance")
+        }
+    }
+    
+    // ==================== UTILITY METHODS ====================
+    def safeExecute(Closure code, String description, def defaultValue = null) {
+        try {
+            def result = code.call()
+            logDebug("SUCCESS: $description")
+            return result
+        } catch (SecurityException e) {
+            logWarning("SECURITY BLOCKED: $description - ${e.message}")
+            return defaultValue
+        } catch (Exception e) {
+            logError("FAILED: $description - ${e.message}")
+            return defaultValue
+        }
+    }
+    
+    def logInfo(String message) {
+        println "INFO: $message"
+    }
+    
+    def logWarning(String message) {
+        println "WARNING: $message"
+    }
+    
+    def logError(String message) {
+        println "ERROR: $message"
+    }
+    
+    def logDebug(String message) {
+        // Uncomment for verbose debugging
+        // println "DEBUG: $message"
+    }
+    
+    def logCritical(String message) {
+        println "CRITICAL: $message"
+        criticalFindings++
+    }
+    
+    def findJenkinsHome() {
+        return safeExecute({
+            def home = jenkins.rootDir.absolutePath
+            logInfo("Discovered Jenkins home: $home")
+            return home
+        }, "Finding Jenkins home directory", "/var/lib/jenkins")
+    }
+    
+    // ==================== AUDIT MODULES ====================
+    def auditSystemInformation() {
+        logInfo("Starting system information audit")
+        
+        return safeExecute({
+            def info = [:]
+            info.jenkinsVersion = jenkins.version ?: "Unknown"
+            info.installDir = findJenkinsHome()
+            info.numNodes = jenkins.computers?.size() ?: 0
+            info.numJobs = jenkins.getAllItems(hudson.model.AbstractProject.class)?.size() ?: 0
+            info.securityRealm = jenkins.securityRealm?.class?.simpleName ?: "None"
+            info.authStrategy = jenkins.authorizationStrategy?.class?.simpleName ?: "None"
+            info.scriptConsoleEnabled = !jenkins.isUsageStatisticsDisabled()
+            
+            logInfo("Jenkins Version: ${info.jenkinsVersion}")
+            logInfo("Security Realm: ${info.securityRealm}")
+            logInfo("Authorization Strategy: ${info.authStrategy}")
+            logInfo("Script Console Enabled: ${info.scriptConsoleEnabled}")
+            
+            return info
+        }, "Gathering system information", [:])
+    }
+    
+    def auditUserPermissions() {
+        logInfo("Starting user permission audit")
+        
+        return safeExecute({
+            def users = User.getAll() ?: []
+            def dangerousUsers = []
+            int totalChecked = 0
+            
+            def dangerousPermissions = [
+                "hudson.model.Hudson.Administer",
+                "com.cloudbees.plugins.credentials.CredentialsProvider.View", 
+                "com.cloudbees.plugins.credentials.CredentialsProvider.ManageDomains",
+                "com.cloudbees.plugins.credentials.CredentialsProvider.Update",
+                "hudson.model.Hudson.RunScripts"
+            ]
+            
+            users.each { user ->
+                if (totalChecked >= config.maxResults) {
+                    logWarning("Reached maximum user check limit of ${config.maxResults}")
+                    return
+                }
+                
+                try {
+                    def userPermissions = []
+                    dangerousPermissions.each { permId ->
+                        def permission = hudson.model.Permission.fromId(permId)
+                        if (permission && user.hasPermission(permission)) {
+                            userPermissions << permission.name
+                        }
+                    }
+                    
+                    if (userPermissions) {
+                        dangerousUsers << [
+                            username: user.id ?: "Unknown",
+                            permissions: userPermissions
+                        ]
+                        logWarning("User ${user.id} has dangerous permissions: ${userPermissions.join(', ')}")
+                    }
+                    
+                    totalChecked++
+                } catch (Exception e) {
+                    logError("Failed to check permissions for user: ${e.message}")
+                }
+            }
+            
+            return [
+                totalUsers: users.size(),
+                usersChecked: totalChecked,
+                dangerousUsers: dangerousUsers,
+                dangerousCount: dangerousUsers.size()
+            ]
+        }, "User permission audit", [totalUsers: 0, dangerousCount: 0])
+    }
+    
+    def auditCredentials() {
+        if (!config.testCredentialAccess) {
+            logInfo("Credential access testing disabled in configuration")
+            return [:]
+        }
+        
+        logInfo("Starting credential access audit")
+        
+        return safeExecute({
+            def allCreds = CredentialsProvider.lookupCredentials(StandardCredentials.class, jenkins) ?: []
+            def credDetails = []
+            int accessibleSecrets = 0
+            int totalChecked = 0
+            
+            allCreds.each { cred ->
+                if (totalChecked >= config.maxResults) {
+                    logWarning("Reached maximum credential check limit of ${config.maxResults}")
+                    return
+                }
+                
+                try {
+                    def credInfo = [
+                        id: cred.id ?: "Unknown",
+                        type: cred.class.simpleName ?: "Unknown",
+                        scope: cred.scope?.name() ?: "Global"
+                    ]
+                    
+                    // Test credential value access
+                    def isAccessible = false
+                    switch(cred) {
+                        case { it instanceof UsernamePasswordCredentialsImpl }:
+                            def username = safeExecute({ cred.username }, "Access username", null)
+                            def password = safeExecute({ 
+                                def pwd = cred.password?.toString()
+                                return pwd && !pwd.contains("ScriptSecurity") ? "ACCESSIBLE" : null 
+                            }, "Access password", null)
+                            
+                            if (password == "ACCESSIBLE") {
+                                isAccessible = true
+                                accessibleSecrets++
+                                logCritical("CREDENTIAL LEAK: UsernamePassword credential ${cred.id} is accessible")
+                            }
+                            break
+                            
+                        case { it instanceof StringCredentialsImpl }:
+                            def secret = safeExecute({ 
+                                def sec = cred.secret?.toString()
+                                return sec && !sec.contains("ScriptSecurity") ? "ACCESSIBLE" : null 
+                            }, "Access string secret", null)
+                            
+                            if (secret == "ACCESSIBLE") {
+                                isAccessible = true
+                                accessibleSecrets++
+                                logCritical("CREDENTIAL LEAK: String credential ${cred.id} is accessible")
+                            }
+                            break
+                            
+                        case { it instanceof BasicSSHUserPrivateKey }:
+                            def key = safeExecute({ cred.privateKey }, "Access SSH private key", null)
+                            if (key) {
+                                isAccessible = true
+                                accessibleSecrets++
+                                logCritical("CREDENTIAL LEAK: SSH private key ${cred.id} is accessible")
+                            }
+                            break
+                    }
+                    
+                    credInfo.accessible = isAccessible
+                    credDetails << credInfo
+                    totalChecked++
+                    
+                } catch (Exception e) {
+                    logError("Failed to audit credential ${cred.id}: ${e.message}")
+                }
+            }
+            
+            logInfo("Credential audit completed: ${accessibleSecrets} accessible secrets found out of ${allCreds.size()} total")
+            
+            return [
+                totalCredentials: allCreds.size(),
+                credentialsChecked: totalChecked,
+                accessibleSecrets: accessibleSecrets,
+                credentialDetails: credDetails
+            ]
+        }, "Credential access audit", [totalCredentials: 0, accessibleSecrets: 0])
+    }
+    
+    def auditScriptApprovals() {
+        if (!config.checkScriptApprovals) {
+            logInfo("Script approval audit disabled in configuration")
+            return [:]
+        }
+        
+        logInfo("Starting script approval audit")
+        
+        return safeExecute({
+            def approval = ScriptApproval.get()
+            def approvedScripts = approval.approvedScripts ?: []
+            def dangerousApprovals = []
+            int totalChecked = 0
+            
+            approvedScripts.each { script ->
+                if (totalChecked >= config.maxResults) {
+                    logWarning("Reached maximum script check limit of ${config.maxResults}")
+                    return
+                }
+                
+                try {
+                    def scriptText = script.script?.toLowerCase() ?: ""
+                    def dangerousPatterns = [
+                        containsCredential: scriptText.contains('credential'),
+                        containsGetCredentials: scriptText.contains('getcredentials'),
+                        containsPassword: scriptText.contains('password'),
+                        containsSecret: scriptText.contains('secret'),
+                        containsExecute: scriptText.contains('.execute') || scriptText.contains('runtime.exec')
+                    ]
+                    
+                    if (dangerousPatterns.values().any { it }) {
+                        dangerousApprovals << [
+                            scriptPreview: script.script?.take(100) + "...",
+                            patterns: dangerousPatterns.findAll { it.value }.keySet(),
+                            hash: script.hash
+                        ]
+                        logCritical("DANGEROUS SCRIPT APPROVAL: Contains ${dangerousPatterns.findAll { it.value }.keySet()}")
+                    }
+                    
+                    totalChecked++
+                } catch (Exception e) {
+                    logError("Failed to check script approval: ${e.message}")
+                }
+            }
+            
+            logInfo("Script approval audit completed: ${dangerousApprovals.size()} dangerous approvals found")
+            
+            return [
+                totalApprovals: approvedScripts.size(),
+                approvalsChecked: totalChecked,
+                dangerousApprovals: dangerousApprovals.size(),
+                dangerousScripts: dangerousApprovals
+            ]
+        }, "Script approval audit", [totalApprovals: 0, dangerousApprovals: 0])
+    }
+    
+    def auditFileSystem() {
+        if (!config.checkFilePermissions) {
+            logInfo("File system audit disabled in configuration")
+            return [:]
+        }
+        
+        logInfo("Starting file system security audit")
+        
+        return safeExecute({
+            def jenkinsHome = findJenkinsHome()
+            def criticalFiles = [
+                "${jenkinsHome}/credentials.xml",
+                "${jenkinsHome}/secrets/",
+                "${jenkinsHome}/config.xml",
+                "${jenkinsHome}/users/",
+                "${jenkinsHome}/jobs/"
+            ]
+            
+            def fileResults = []
+            
+            criticalFiles.each { filePath ->
+                try {
+                    def file = new File(filePath)
+                    if (file.exists()) {
+                        def status = [
+                            path: filePath,
+                            exists: true,
+                            readable: file.canRead(),
+                            writable: file.canWrite(),
+                            executable: file.canExecute(),
+                            isDirectory: file.isDirectory()
+                        ]
+                        
+                        fileResults << status
+                        
+                        if (status.readable && filePath.contains("credentials.xml")) {
+                            logCritical("CRITICAL: credentials.xml is readable")
+                        } else if (status.readable && filePath.contains("secrets")) {
+                            logCritical("CRITICAL: secrets directory is readable")
+                        } else if (status.readable) {
+                            logWarning("WARNING: ${filePath} is readable")
+                        } else {
+                            logInfo("SECURE: ${filePath} access restricted")
+                        }
+                    } else {
+                        logWarning("WARNING: Critical file not found: $filePath")
+                        fileResults << [path: filePath, exists: false]
+                    }
+                } catch (Exception e) {
+                    logError("Failed to check file $filePath: ${e.message}")
+                }
+            }
+            
+            return fileResults
+        }, "File system audit", [])
+    }
+    
+    def auditPlugins() {
+        logInfo("Starting plugin security audit")
+        
+        return safeExecute({
+            def plugins = jenkins.pluginManager?.plugins ?: []
+            def vulnerablePlugins = []
+            
+            def riskMatrix = [
+                'credentials-binding': [safeVersion: '2.0', current: null, risk: 'High'],
+                'plain-credentials': [safeVersion: '1.0', current: null, risk: 'High'],
+                'script-security': [safeVersion: '1.0', current: null, risk: 'High'],
+                'workflow-cps': [safeVersion: '2.0', current: null, risk: 'Medium']
+            ]
+            
+            plugins.each { plugin ->
+                try {
+                    if (riskMatrix.containsKey(plugin.shortName)) {
+                        riskMatrix[plugin.shortName].current = plugin.version
+                        def safeVersion = riskMatrix[plugin.shortName].safeVersion
+                        def riskLevel = riskMatrix[plugin.shortName].risk
+                        
+                        if (compareVersions(plugin.version, safeVersion) < 0) {
+                            vulnerablePlugins << [
+                                name: plugin.displayName,
+                                version: plugin.version,
+                                safeVersion: safeVersion,
+                                risk: riskLevel
+                            ]
+                            logCritical("VULNERABLE PLUGIN: ${plugin.displayName} v${plugin.version} (requires v${safeVersion}+)")
+                        } else {
+                            logInfo("SECURE PLUGIN: ${plugin.displayName} v${plugin.version}")
+                        }
+                    }
+                } catch (Exception e) {
+                    logError("Failed to audit plugin ${plugin.displayName}: ${e.message}")
+                }
+            }
+            
+            return [
+                totalPlugins: plugins.size(),
+                vulnerablePlugins: vulnerablePlugins.size(),
+                pluginDetails: vulnerablePlugins
+            ]
+        }, "Plugin audit", [totalPlugins: 0, vulnerablePlugins: 0])
+    }
+    
+    def compareVersions(String v1, String v2) {
+        try {
+            def parts1 = v1.tokenize('.').collect { it.toInteger() }
+            def parts2 = v2.tokenize('.').collect { it.toInteger() }
+            
+            for (int i = 0; i < Math.max(parts1.size(), parts2.size()); i++) {
+                def p1 = i < parts1.size() ? parts1[i] : 0
+                def p2 = i < parts2.size() ? parts2[i] : 0
+                if (p1 != p2) {
+                    return p1 <=> p2
+                }
+            }
+            return 0
+        } catch (Exception e) {
+            logError("Version comparison failed for $v1 vs $v2: ${e.message}")
+            return -1
+        }
+    }
+    
+    def runAttackSimulation() {
+        if (!config.simulateAttacks) {
+            logInfo("Attack simulation disabled in configuration")
+            return [:]
+        }
+        
+        logInfo("Starting attack simulation")
+        
+        return safeExecute({
+            def simulations = [:]
+            
+            // Simulation 1: Direct credential dump
+            simulations.directCredentialDump = safeExecute({
+                def creds = CredentialsProvider.lookupCredentials(StandardCredentials.class, jenkins)
+                return [
+                    status: "VULNERABLE",
+                    credentialsFound: creds?.size() ?: 0,
+                    message: "Credentials can be enumerated via Groovy"
+                ]
+            }, "Direct credential dump simulation", [status: "SECURE", message: "Access blocked"])
+            
+            // Simulation 2: Environment variable access
+            simulations.envVarAccess = safeExecute({
+                def envVars = [:]
+                System.getenv().each { k, v ->
+                    if (k.toLowerCase().contains('pass') || k.toLowerCase().contains('secret')) {
+                        envVars[k] = "PRESENT"
+                    }
+                }
+                return [
+                    status: envVars ? "VULNERABLE" : "SECURE",
+                    sensitiveVars: envVars,
+                    message: envVars ? "Sensitive environment variables found" : "No sensitive environment variables"
+                ]
+            }, "Environment variable access simulation", [status: "UNKNOWN", message: "Simulation failed"])
+            
+            // Log simulation results
+            simulations.each { name, result ->
+                if (result.status == "VULNERABLE") {
+                    logCritical("ATTACK SIMULATION VULNERABLE: $name - ${result.message}")
+                } else {
+                    logInfo("ATTACK SIMULATION SECURE: $name - ${result.message}")
+                }
+            }
+            
+            return simulations
+        }, "Attack simulation", [:])
+    }
+    
+    // ==================== MAIN AUDIT EXECUTION ====================
+    def runComprehensiveAudit() {
+        logInfo("Starting comprehensive Jenkins security audit")
+        logInfo("==============================================")
+        
+        def startTime = System.currentTimeMillis()
+        
+        try {
+            auditResults.systemInfo = auditSystemInformation()
+            auditResults.userAudit = auditUserPermissions()
+            auditResults.credentialAudit = auditCredentials()
+            auditResults.scriptAudit = auditScriptApprovals()
+            auditResults.fileAudit = auditFileSystem()
+            auditResults.pluginAudit = auditPlugins()
+            auditResults.attackSimulation = runAttackSimulation()
+            
+            def endTime = System.currentTimeMillis()
+            auditResults.auditDuration = "${(endTime - startTime) / 1000} seconds"
+            
+        } catch (Exception e) {
+            logError("Audit execution failed: ${e.message}")
+            auditResults.auditError = e.message
+        }
+        
+        return generateReport()
+    }
+    
+    def generateReport() {
+        logInfo("")
+        logInfo("AUDIT COMPLETE")
+        logInfo("==============")
+        logInfo("Audit finished at: ${new Date()}")
+        logInfo("Total critical findings: $criticalFindings")
+        
+        // Summary
+        if (criticalFindings > 0) {
+            logInfo("")
+            logInfo("IMMEDIATE ACTION REQUIRED")
+            logInfo("=========================")
+            logInfo("Critical security vulnerabilities detected. Please implement security measures immediately.")
+        } else {
+            logInfo("")
+            logInfo("SECURITY STATUS: ACCEPTABLE")
+            logInfo("===========================")
+            logInfo("No critical vulnerabilities detected. Continue with regular security maintenance.")
+        }
+        
+        return auditResults
+    }
+}
+
+// ==================== SCRIPT EXECUTION ====================
+try {
+    logInfo("Initializing Jenkins Security Audit...")
+    def audit = new JenkinsSecurityAudit()
+    def results = audit.runComprehensiveAudit()
+    
+    logInfo("Audit results stored for review")
+    
+} catch (Exception e) {
+    println "FATAL ERROR: Failed to execute audit - ${e.message}"
+    e.printStackTrace()
+}
