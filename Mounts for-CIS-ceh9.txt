@@ -1,0 +1,16 @@
+Mount point	LV name	Size (GiB)	Filesystem	Mount options
+/boot/efi	—	1	FAT32	defaults
+/boot	—	2	XFS	defaults
+/	root	100	XFS	defaults
+/home	home	30	XFS	nodev,nosuid
+/tmp	tmp	40	XFS	nodev,nosuid,noexec
+/var	var	30	XFS	nodev,nosuid
+/var/tmp	vartmp	10	XFS	nodev,nosuid,noexec
+/var/log	log	20	XFS	nodev,nosuid,noexec
+/var/log/audit	audit	20	XFS	nodev,nosuid,noexec
+/opt	opt	30	XFS	defaults
+/u01	oracle	120	XFS	defaults
+Swap	swap	16	Swap	defaults
+Allocated		419		
+LVM reserve		~46		
+Total		~465		
